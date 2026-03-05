@@ -22,6 +22,9 @@
 const float voltMax = 12.6; // 100% (4.2V * 3)
 const float voltMin = 9.0;  // 0% (3.0V * 3)
 const float dividerRatio = 5.0; 
+unsigned long prevBatMillis = 0;
+const unsigned long batteryInterval = 60000; // Update battery every 60 seconds
+uint32_t lastStablePct = 0; 
 
 EasyNex nex(Serial); 
 DHT dht(DHTPIN, DHTTYPE);
@@ -66,19 +69,36 @@ void syncNextionWithEEPROM() {
   nex.writeNum("nnGas.val", (uint32_t)sGas);
 }
 
+
+
+// --- Updated refreshNextion Function ---
 void refreshNextion(float temperature, float humidity, int gasValue, bool flameDetected) {
-  // --- Battery Calculation ---
-  int rawBat = analogRead(BATTERY_PIN);
-  float vOut = (rawBat * 5.0) / 1024.0;
-  float batteryVoltage = vOut * dividerRatio;
-  float batteryPct = ((batteryVoltage - voltMin) / (voltMax - voltMin)) * 100.0;
-  batteryPct = constrain(batteryPct, 0, 100);
+  
+  unsigned long currentMillis = millis();
+
+  // ONLY update battery if 60 seconds have passed OR if it's the first run
+  if (currentMillis - prevBatMillis >= batteryInterval || prevBatMillis == 0) {
+    prevBatMillis = currentMillis;
+
+    // Smooth Sampling: Take 10 readings and average them
+    long runningTotal = 0;
+    for(int i=0; i<10; i++) {
+      runningTotal += analogRead(BATTERY_PIN);
+      delay(5); 
+    }
+    int rawBat = runningTotal / 10;
+
+    float vOut = (rawBat * 5.0) / 1024.0;
+    float batteryVoltage = vOut * dividerRatio;
+    float batteryPct = ((batteryVoltage - voltMin) / (voltMax - voltMin)) * 100.0;
+    lastStablePct = (uint32_t)constrain(batteryPct, 0, 100);
+  }
 
   // --- Send Data to Nextion ---
   nex.writeNum("nTemp.val", (uint32_t)temperature);
   nex.writeNum("nHumidity.val", (uint32_t)humidity);
   nex.writeNum("nGas.val", (uint32_t)gasValue);
-  nex.writeNum("nVoltage.val", (uint32_t)batteryPct); // Sending Percentage to nVoltage
+  nex.writeNum("nVoltage.val", lastStablePct); // Use the last stable average
 
   nex.writeNum("pFlame.pic", flameDetected ? 0 : 1);
   nex.writeNum("pGas.pic", (gasValue > sGas) ? 11 : 12);
