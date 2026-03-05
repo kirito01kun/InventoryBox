@@ -8,7 +8,7 @@
 #define RELAY_OFF   HIGH  
 
 // ---------- Pin Definitions ----------
-#define DHTPIN        8       
+#define DHTPIN        8        
 #define DHTTYPE      DHT11
 #define MQ6_PIN      A3      
 #define FLAME_PIN    3        
@@ -16,6 +16,12 @@
 #define RELAY_PUMP   5        
 #define BUZZER_PIN   6        
 #define LED_ALARM    7        
+#define BATTERY_PIN  A0  // Battery Voltage Sensor Pin
+
+// ---------- Battery Constants ----------
+const float voltMax = 12.6; // 100% (4.2V * 3)
+const float voltMin = 9.0;  // 0% (3.0V * 3)
+const float dividerRatio = 5.0; 
 
 EasyNex nex(Serial); 
 DHT dht(DHTPIN, DHTTYPE);
@@ -61,9 +67,18 @@ void syncNextionWithEEPROM() {
 }
 
 void refreshNextion(float temperature, float humidity, int gasValue, bool flameDetected) {
+  // --- Battery Calculation ---
+  int rawBat = analogRead(BATTERY_PIN);
+  float vOut = (rawBat * 5.0) / 1024.0;
+  float batteryVoltage = vOut * dividerRatio;
+  float batteryPct = ((batteryVoltage - voltMin) / (voltMax - voltMin)) * 100.0;
+  batteryPct = constrain(batteryPct, 0, 100);
+
+  // --- Send Data to Nextion ---
   nex.writeNum("nTemp.val", (uint32_t)temperature);
   nex.writeNum("nHumidity.val", (uint32_t)humidity);
   nex.writeNum("nGas.val", (uint32_t)gasValue);
+  nex.writeNum("nVoltage.val", (uint32_t)batteryPct); // Sending Percentage to nVoltage
 
   nex.writeNum("pFlame.pic", flameDetected ? 0 : 1);
   nex.writeNum("pGas.pic", (gasValue > sGas) ? 11 : 12);
@@ -71,7 +86,7 @@ void refreshNextion(float temperature, float humidity, int gasValue, bool flameD
   nex.writeNum("pHumidity.pic", (humidity > sHumidity) ? 5 : 4);
 
   bool fanState = (digitalRead(RELAY_FAN) == RELAY_ON);
-  nex.writeNum("pFan.pic", fanState ? 8 : 7); 
+  nex.writeNum("pFan.pic", fanState ? 7 : 8); 
   
   bool pumpState = (digitalRead(RELAY_PUMP) == RELAY_ON);
   nex.writeNum("pPompe.pic", pumpState ? 9 : 10);
@@ -79,14 +94,13 @@ void refreshNextion(float temperature, float humidity, int gasValue, bool flameD
 
 // ---------- Logic Control ----------
 void checkThresholds(float temperature, float humidity, int gasValue, bool flameDetected) {
-  bool criticalAlert = (flameDetected || gasValue > sGas);
+  bool gasAlert = (gasValue > sGas);
+  bool criticalAlert = (flameDetected || gasAlert);
   
+  // --- 1. ALARM HARDWARE (Buzzer & LED) ---
   if (criticalAlert) {
     digitalWrite(LED_ALARM, HIGH);
-    digitalWrite(RELAY_PUMP, RELAY_ON); 
-
-    // --- WAR ALERT BUZZER (Non-blocking Pulse) ---
-    // Pulses every 150ms for a high-intensity "War" sound
+    // Non-blocking Pulse for Buzzer
     unsigned long currentMillis = millis();
     if (currentMillis - buzzerMillis >= 150) { 
       buzzerMillis = currentMillis;
@@ -94,11 +108,15 @@ void checkThresholds(float temperature, float humidity, int gasValue, bool flame
       digitalWrite(BUZZER_PIN, buzzerState);
     }
   } else {
-    // Normal Mode: Buzzer OFF
     digitalWrite(BUZZER_PIN, LOW); 
     digitalWrite(LED_ALARM, LOW);
-    
-    // Automatic Cooling/Heat Management
+  }
+
+  // --- 2. PUMP LOGIC (Flame or High Heat) ---
+  if (flameDetected) {
+    digitalWrite(RELAY_PUMP, RELAY_ON); // Priority: Fire suppression
+  } else {
+    // Normal Automatic Heat Management for Pump
     if (!isnan(temperature)) {
       if (temperature > (sTemp + 10)) digitalWrite(RELAY_PUMP, RELAY_ON); 
       else if (temperature < (sTemp + 8)) digitalWrite(RELAY_PUMP, RELAY_OFF);
@@ -107,18 +125,21 @@ void checkThresholds(float temperature, float humidity, int gasValue, bool flame
     }
   }
 
-  // Fan Logic
-  if (!isnan(temperature) && !isnan(humidity)) {
-    if (temperature > sTemp || humidity > sHumidity) digitalWrite(RELAY_FAN, RELAY_ON);
-    else if (temperature < (sTemp - 1) && humidity < (sHumidity - 1)) digitalWrite(RELAY_FAN, RELAY_OFF);
+  // --- 3. FAN LOGIC (Gas or High Temp/Humidity) ---
+  if (gasAlert) {
+    digitalWrite(RELAY_FAN, RELAY_ON); // Priority: Exhausting Gas
   } else {
-    digitalWrite(RELAY_FAN, RELAY_OFF);
+    // Normal Ventilation Logic
+    if (!isnan(temperature) && !isnan(humidity)) {
+      if (temperature > sTemp || humidity > sHumidity) digitalWrite(RELAY_FAN, RELAY_ON);
+      else if (temperature < (sTemp - 1) && humidity < (sHumidity - 1)) digitalWrite(RELAY_FAN, RELAY_OFF);
+    } else {
+      digitalWrite(RELAY_FAN, RELAY_OFF);
+    }
   }
 }
 
 // ---------- Nextion Triggers ----------
-
-// SAVE BUTTON (Trigger 0)
 void trigger0() {
   delay(100);  
   uint32_t nt = nex.readNumber("sTemp.val");
@@ -130,22 +151,17 @@ void trigger0() {
     sHumidity = (float)nh;
     sGas = (int)ng;
     saveThresholdsToEEPROM();
-    
-    // Success: 1 Long Beep
     digitalWrite(BUZZER_PIN, HIGH); delay(1000); digitalWrite(BUZZER_PIN, LOW);
     syncNextionWithEEPROM();  
   } else {
-    // Failure: 3 Short Beeps
     for(int i=0; i<3; i++){
       digitalWrite(BUZZER_PIN, HIGH); delay(100); digitalWrite(BUZZER_PIN, LOW); delay(100);
     }
   }
 }
 
-// HANDSHAKE REQUEST (Trigger 1)
 void trigger1() {
   syncNextionWithEEPROM();
-  // Handshake: 2 Short Beeps
   for(int i=0; i<2; i++){
     digitalWrite(BUZZER_PIN, HIGH); delay(100); digitalWrite(BUZZER_PIN, LOW); delay(100);
   }
@@ -158,6 +174,7 @@ void setup() {
   
   pinMode(FLAME_PIN, INPUT);
   pinMode(MQ6_PIN, INPUT);
+  pinMode(BATTERY_PIN, INPUT);
   pinMode(RELAY_FAN, OUTPUT);
   pinMode(RELAY_PUMP, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
